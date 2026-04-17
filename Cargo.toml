@@ -1,11 +1,11 @@
 [package]
 name = "rati"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
-description = "rati"
+description = "Lightweight S3-backed tile server for Valhalla graph and speed tiles"
 readme = "README.md"
-repository = "https://github.com/Stepan Kizim/rati"
+repository = "https://github.com/kinkard/rati"
 license = "MIT OR Apache-2.0"
 include = ["**/*.rs"]
 
@@ -16,8 +16,15 @@ strip = true
 lto = "thin"
 
 [dependencies]
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 axum = "0.8"
+bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
+flate2 = "1"
+rustc-hash = "2.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
