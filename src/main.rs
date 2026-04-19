@@ -28,7 +28,7 @@ struct Config {
     /// Override the dataset ID (auto-detected from graph tile headers if omitted)
     #[arg(long)]
     dataset_id: Option<String>,
-    /// Cache-Control max-age in seconds (default: 86400 = 1 day)
+    /// Cache-Control max-age in seconds
     #[arg(long, default_value_t = 86400)]
     cache_max_age: u32,
     /// Port to listen
