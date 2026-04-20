@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::get,
@@ -147,6 +147,7 @@ async fn set_cache_headers(
 }
 
 async fn get_tile(
+    method: Method,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(path): Path<String>,
@@ -175,12 +176,18 @@ async fn get_tile(
         return gzip_tile(&state, tile_id).await.into_response();
     }
 
+    // HEAD on plain tiles: return size from index without fetching from S3
+    if method == Method::HEAD {
+        return tile_head(&state, tile_id).into_response();
+    }
+
     get_tile_data(&state, tile_id).await.into_response()
 }
 
 /// Supports `Accept-Encoding: gzip` (mode 1) but not `.gz` extension (mode 2),
 /// because numeric IDs have no file extension to append `.gz` to.
 async fn get_tile_by_id(
+    method: Method,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(tile_id): Path<u32>,
@@ -195,7 +202,20 @@ async fn get_tile_by_id(
         return gzip_tile(&state, tile_id).await.into_response();
     }
 
+    if method == Method::HEAD {
+        return tile_head(&state, tile_id).into_response();
+    }
+
     get_tile_data(&state, tile_id).await.into_response()
+}
+
+/// HEAD for plain tiles: return Content-Length from the index without fetching from S3.
+fn tile_head(state: &AppState, tile_id: archive::TileId) -> Result<impl IntoResponse, StatusCode> {
+    let size = state
+        .archive
+        .tile_size(tile_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok([(axum::http::header::CONTENT_LENGTH, size.to_string())])
 }
 
 async fn get_tile_data(state: &AppState, tile_id: archive::TileId) -> Result<Bytes, StatusCode> {

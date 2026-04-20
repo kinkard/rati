@@ -395,6 +395,11 @@ impl S3Archive {
         let data = get_range(&self.client, &self.bucket, &self.key, offset, size as u64).await?;
         Ok(Some(data))
     }
+
+    /// Returns the tile size in bytes from the index, or `None` if the tile doesn't exist.
+    pub fn tile_size(&self, tile_id: TileId) -> Option<u32> {
+        self.index.get(&tile_id).map(|&(_, size)| size)
+    }
 }
 
 async fn get_range(
