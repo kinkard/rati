@@ -6,7 +6,8 @@ use axum::{
     Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    middleware,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use bytes::Bytes;
@@ -42,8 +43,6 @@ struct Config {
 #[derive(Clone)]
 struct AppState {
     archive: Arc<archive::S3Archive>,
-    /// Pre-built cache related headers shared across all tile responses.
-    tile_headers: HeaderMap,
     /// Pre-built status response (nothing changes at runtime).
     status: StatusResponse,
 }
@@ -79,10 +78,9 @@ async fn run(config: Config) {
         config.archive, meta.tile_count, meta.dataset_id,
     );
 
-    let tile_headers = build_tile_headers(&meta, config.cache_max_age);
+    let cache_headers = build_cache_headers(&meta, config.cache_max_age);
     let state = AppState {
         archive: Arc::new(archive),
-        tile_headers,
         status: StatusResponse {
             dataset_id: meta.dataset_id,
             tile_count: meta.tile_count,
@@ -91,9 +89,13 @@ async fn run(config: Config) {
     };
 
     let app = Router::new()
-        .route("/", get(get_status))
         .route("/tiles/{*path}", get(get_tile))
         .route("/tiles_by_id/{tile_id}", get(get_tile_by_id))
+        .layer(middleware::from_fn_with_state(
+            cache_headers,
+            set_cache_headers,
+        ))
+        .route("/", get(get_status))
         .route("/health", get(|| async { "OK" }))
         .with_state(state);
 
@@ -132,31 +134,47 @@ async fn get_status(State(state): State<AppState>) -> axum::Json<StatusResponse>
     axum::Json(state.status.clone())
 }
 
+/// Middleware that merges pre-built tile headers into every response.
+async fn set_cache_headers(
+    State(cache_headers): State<HeaderMap>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().extend(cache_headers);
+    response
+}
+
 async fn get_tile(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(path): Path<String>,
-) -> impl IntoResponse {
-    // Mode 2: `.gz` extension — client explicitly requests gzip file
-    if let Some(base_path) = path.strip_suffix(".gz") {
-        let tile_id = match archive::TileId::from_path(base_path) {
-            Some(id) => id,
-            None => return Err(StatusCode::BAD_REQUEST),
-        };
-        return fetch_tile_gz_file(&state, tile_id).await;
+) -> Response {
+    if is_not_modified(&headers, &state.status.etag) {
+        return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let tile_id = match archive::TileId::from_path(&path) {
-        Some(id) => id,
-        None => return Err(StatusCode::BAD_REQUEST),
+    // Mode 2: `.gz` extension — raw gzip file, no Content-Encoding
+    if let Some(base_path) = path.strip_suffix(".gz") {
+        let Some(tile_id) = archive::TileId::from_path(base_path) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        return get_tile_data(&state, tile_id)
+            .await
+            .map(|data| Bytes::from(gzip_compress(&data)))
+            .into_response();
+    }
+
+    let Some(tile_id) = archive::TileId::from_path(&path) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
 
     // Mode 1: `Accept-Encoding: gzip` — compress on the fly with Content-Encoding
     if accepts_gzip(&headers) {
-        return fetch_tile_gzip_encoded(&state, tile_id).await;
+        return gzip_tile(&state, tile_id).await.into_response();
     }
 
-    fetch_tile(&state, tile_id).await
+    get_tile_data(&state, tile_id).await.into_response()
 }
 
 /// Supports `Accept-Encoding: gzip` (mode 1) but not `.gz` extension (mode 2),
@@ -165,14 +183,18 @@ async fn get_tile_by_id(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(tile_id): Path<u32>,
-) -> impl IntoResponse {
+) -> Response {
+    if is_not_modified(&headers, &state.status.etag) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+
     let tile_id = archive::TileId::new(tile_id);
 
     if accepts_gzip(&headers) {
-        return fetch_tile_gzip_encoded(&state, tile_id).await;
+        return gzip_tile(&state, tile_id).await.into_response();
     }
 
-    fetch_tile(&state, tile_id).await
+    get_tile_data(&state, tile_id).await.into_response()
 }
 
 async fn get_tile_data(state: &AppState, tile_id: archive::TileId) -> Result<Bytes, StatusCode> {
@@ -186,37 +208,31 @@ async fn get_tile_data(state: &AppState, tile_id: archive::TileId) -> Result<Byt
     }
 }
 
-async fn fetch_tile(
+/// Compress tile on the fly and set `Content-Encoding: gzip`.
+async fn gzip_tile(
     state: &AppState,
     tile_id: archive::TileId,
-) -> Result<(HeaderMap, Bytes), StatusCode> {
-    let data = get_tile_data(state, tile_id).await?;
-    Ok((state.tile_headers.clone(), data))
-}
-
-/// Mode 1: `Accept-Encoding: gzip` — compress on the fly, set `Content-Encoding: gzip`.
-async fn fetch_tile_gzip_encoded(
-    state: &AppState,
-    tile_id: archive::TileId,
-) -> Result<(HeaderMap, Bytes), StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     let data = get_tile_data(state, tile_id).await?;
     let compressed = gzip_compress(&data);
-    let mut headers = state.tile_headers.clone();
-    headers.insert(
-        axum::http::header::CONTENT_ENCODING,
-        HeaderValue::from_static("gzip"),
-    );
-    Ok((headers, Bytes::from(compressed)))
+    Ok((
+        [(axum::http::header::CONTENT_ENCODING, "gzip")],
+        Bytes::from(compressed),
+    ))
 }
 
-/// Mode 2: `.gz` extension — return raw gzip bytes, no `Content-Encoding` header.
-async fn fetch_tile_gz_file(
-    state: &AppState,
-    tile_id: archive::TileId,
-) -> Result<(HeaderMap, Bytes), StatusCode> {
-    let data = get_tile_data(state, tile_id).await?;
-    let compressed = gzip_compress(&data);
-    Ok((state.tile_headers.clone(), Bytes::from(compressed)))
+/// Per RFC 9110 §13.1.2, returns `true` if any ETag in `If-None-Match` matches
+/// (or the wildcard `*` is present), meaning the server should respond with 304.
+fn is_not_modified(request_headers: &HeaderMap, etag: &str) -> bool {
+    request_headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',').any(|part| {
+                let part = part.trim();
+                part == "*" || part == etag
+            })
+        })
 }
 
 /// Per RFC 7231 section 5.3.4, `gzip;q=0` means gzip is explicitly unacceptable.
@@ -252,14 +268,9 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish on Vec cannot fail")
 }
 
-/// Derived once at startup so that handlers can simply clone instead of re-computing per request.
-fn build_tile_headers(meta: &archive::ArchiveMeta, cache_max_age: u32) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+/// Derived once at startup; the `set_cache_headers` middleware merges these into every tile response.
+fn build_cache_headers(meta: &archive::ArchiveMeta, cache_max_age: u32) -> HeaderMap {
+    let mut headers = HeaderMap::with_capacity(8);
 
     if let Ok(val) = HeaderValue::from_str(&meta.etag) {
         headers.insert(axum::http::header::ETAG, val);
@@ -291,19 +302,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tile_headers_include_all_required_fields() {
+    fn cache_headers_include_all_required_fields() {
         let meta = archive::ArchiveMeta {
             etag: "\"abc123\"".into(),
             last_modified: "Thu, 17 Apr 2025 12:00:00 GMT".into(),
             dataset_id: "42".into(),
             tile_count: 100,
         };
-        let headers = build_tile_headers(&meta, 3600);
+        let headers = build_cache_headers(&meta, 3600);
 
-        assert_eq!(
-            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
-            "application/octet-stream"
-        );
         assert_eq!(headers.get(axum::http::header::ETAG).unwrap(), "\"abc123\"");
         assert_eq!(
             headers.get(axum::http::header::LAST_MODIFIED).unwrap(),
@@ -321,14 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn tile_headers_default_cache_max_age() {
+    fn cache_headers_default_cache_max_age() {
         let meta = archive::ArchiveMeta {
             etag: "\"x\"".into(),
             last_modified: "Thu, 01 Jan 2025 00:00:00 GMT".into(),
             dataset_id: "test-dataset".into(),
             tile_count: 1,
         };
-        let headers = build_tile_headers(&meta, 86400);
+        let headers = build_cache_headers(&meta, 86400);
 
         assert_eq!(
             headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
@@ -337,19 +344,42 @@ mod tests {
     }
 
     #[test]
-    fn tile_headers_zero_max_age() {
+    fn cache_headers_zero_max_age() {
         let meta = archive::ArchiveMeta {
             etag: "\"x\"".into(),
             last_modified: "Thu, 01 Jan 2025 00:00:00 GMT".into(),
             dataset_id: "ds".into(),
             tile_count: 1,
         };
-        let headers = build_tile_headers(&meta, 0);
+        let headers = build_cache_headers(&meta, 0);
 
         assert_eq!(
             headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
             "public, max-age=0, immutable"
         );
+    }
+
+    #[test]
+    fn is_not_modified_test() {
+        let with = |val: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::IF_NONE_MATCH,
+                HeaderValue::from_static(val),
+            );
+            h
+        };
+        let etag = "\"abc123\"";
+
+        // Matches
+        assert!(is_not_modified(&with("\"abc123\""), etag));
+        assert!(is_not_modified(&with("\"other\", \"abc123\""), etag));
+        assert!(is_not_modified(&with("*"), etag));
+
+        // No match
+        assert!(!is_not_modified(&with("\"different\""), etag));
+        assert!(!is_not_modified(&HeaderMap::new(), etag));
+        assert!(!is_not_modified(&with("\"abc123-modified\""), etag));
     }
 
     #[test]
