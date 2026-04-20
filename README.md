@@ -67,11 +67,11 @@ Examples:
 
 ## Gzip Support
 
-Two compression modes are supported:
+Tiles are compressed on the fly. Two modes cover different client expectations:
 
-1. **`Accept-Encoding` negotiation** — When the client sends `Accept-Encoding: gzip`, the response is compressed on the fly with `Content-Encoding: gzip` set. Standard HTTP transparent compression; clients decompress automatically.
+1. **Transparent compression** (`Accept-Encoding: gzip`) — Response includes `Content-Encoding: gzip`; compliant HTTP clients decompress automatically and see plain tile bytes. This is the mode Valhalla uses.
 
-2. **`.gz` extension** — Requesting a path like `/tiles/2/000/818/660.gph.gz` returns raw gzip bytes without `Content-Encoding`. The response body *is* a gzip file. This is the mode Valhalla uses when `mjolnir.tile_url_gz` is configured.
+2. **Raw gzip file** (`.gz` extension) — Requesting `/tiles/2/000/818/660.gph.gz` returns the gzip stream as-is, without `Content-Encoding`. The response body *is* a gzip file — useful for saving compressed tiles to disk.
 
 ## CDN Headers
 

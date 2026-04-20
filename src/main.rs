@@ -156,20 +156,22 @@ async fn get_tile(
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
+    let (path, raw_gzip) = match path.strip_suffix(".gz") {
+        Some(base) => (base, true),
+        None => (path.as_str(), false),
+    };
+
+    let Some(tile_id) = archive::TileId::from_path(path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
     // Mode 2: `.gz` extension — raw gzip file, no Content-Encoding
-    if let Some(base_path) = path.strip_suffix(".gz") {
-        let Some(tile_id) = archive::TileId::from_path(base_path) else {
-            return StatusCode::BAD_REQUEST.into_response();
-        };
+    if raw_gzip {
         return get_tile_data(&state, tile_id)
             .await
             .map(|data| Bytes::from(gzip_compress(&data)))
             .into_response();
     }
-
-    let Some(tile_id) = archive::TileId::from_path(&path) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
 
     // Mode 1: `Accept-Encoding: gzip` — compress on the fly with Content-Encoding
     if accepts_gzip(&headers) {
