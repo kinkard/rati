@@ -43,7 +43,7 @@ rati s3://my-bucket/valhalla/tiles.tar --port 8080
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
 
-## Routes
+## Endpoints
 
 ```
 GET /                              Status: dataset_id, tile_count, s3_source, s3_etag
@@ -53,7 +53,7 @@ GET /tiles_by_id/{tile_id}         Tile by numeric packed ID
 GET /health                        Health check
 ```
 
-The `/tiles/{tilePath}` route is directly compatible with Valhalla's `mjolnir.tile_url` setting, e.g. `/tiles/2/000/818/660.gph`.
+The `/tiles/{tilePath}` endpoint is directly compatible with Valhalla's `mjolnir.tile_url` setting, e.g. `/tiles/2/000/818/660.gph`.
 
 ## Tile Path Convention
 
