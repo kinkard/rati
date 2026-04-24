@@ -98,6 +98,7 @@ async fn run(config: Config) {
         .route("/", get(get_status))
         .route("/health", get(|| async { "OK" }))
         .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
