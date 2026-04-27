@@ -166,6 +166,15 @@ async fn get_tile(
         return StatusCode::BAD_REQUEST.into_response();
     };
 
+    // HEAD: return Content-Length without fetching from S3.
+    // Must come before gzip — browsers send Accept-Encoding on HEAD too.
+    if method == Method::HEAD {
+        if raw_gzip || accepts_gzip(&headers) {
+            return tile_head_gzip(&state, tile_id).await.into_response();
+        }
+        return tile_head(&state, tile_id).into_response();
+    }
+
     // Mode 2: `.gz` extension — raw gzip file, no Content-Encoding
     if raw_gzip {
         return get_tile_data(&state, tile_id)
@@ -177,11 +186,6 @@ async fn get_tile(
     // Mode 1: `Accept-Encoding: gzip` — compress on the fly with Content-Encoding
     if accepts_gzip(&headers) {
         return gzip_tile(&state, tile_id).await.into_response();
-    }
-
-    // HEAD on plain tiles: return size from index without fetching from S3
-    if method == Method::HEAD {
-        return tile_head(&state, tile_id).into_response();
     }
 
     get_tile_data(&state, tile_id).await.into_response()
@@ -201,12 +205,15 @@ async fn get_tile_by_id(
 
     let tile_id = archive::TileId::new(tile_id);
 
-    if accepts_gzip(&headers) {
-        return gzip_tile(&state, tile_id).await.into_response();
+    if method == Method::HEAD {
+        if accepts_gzip(&headers) {
+            return tile_head_gzip(&state, tile_id).await.into_response();
+        }
+        return tile_head(&state, tile_id).into_response();
     }
 
-    if method == Method::HEAD {
-        return tile_head(&state, tile_id).into_response();
+    if accepts_gzip(&headers) {
+        return gzip_tile(&state, tile_id).await.into_response();
     }
 
     get_tile_data(&state, tile_id).await.into_response()
@@ -239,10 +246,39 @@ async fn gzip_tile(
 ) -> Result<impl IntoResponse, StatusCode> {
     let data = get_tile_data(state, tile_id).await?;
     let compressed = gzip_compress(&data);
+    state
+        .archive
+        .cache_tile_gz_size(tile_id, compressed.len() as u32);
     Ok((
         [(axum::http::header::CONTENT_ENCODING, "gzip")],
         Bytes::from(compressed),
     ))
+}
+
+/// HEAD for gzip tiles: return cached compressed size, or fetch+compress once to measure it.
+async fn tile_head_gzip(
+    state: &AppState,
+    tile_id: archive::TileId,
+) -> Result<impl IntoResponse, StatusCode> {
+    let cached = state
+        .archive
+        .tile_gz_size(tile_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let size = if cached != 0 {
+        cached
+    } else {
+        // Cache miss — fetch, compress, cache the size, discard the bytes
+        let data = get_tile_data(state, tile_id).await?;
+        let gz_size = gzip_compress(&data).len() as u32;
+        state.archive.cache_tile_gz_size(tile_id, gz_size);
+        gz_size
+    };
+
+    Ok([
+        (axum::http::header::CONTENT_LENGTH, size.to_string()),
+        (axum::http::header::CONTENT_ENCODING, "gzip".to_string()),
+    ])
 }
 
 /// Per RFC 9110 §13.1.2, returns `true` if any ETag in `If-None-Match` matches

@@ -6,6 +6,8 @@
 //! 1. Fetch bytes [0, 512) — the first tar header — and verify it's `index.bin`.
 //! 2. Fetch bytes [512, 512 + size) — the raw index data — and parse it.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -83,8 +85,15 @@ impl TileIndexEntry {
     }
 }
 
-/// (offset, size) — byte range of a tile within the tar archive.
-type TileIndex = FxHashMap<TileId, (u64, u32)>;
+#[derive(Debug)]
+struct TileEntry {
+    offset: u64,
+    size: u32,
+    /// Gzip-compressed size, lazily evaluated on first gzip HEAD request. 0 means "not yet computed".
+    gz_size: AtomicU32,
+}
+
+type TileIndex = FxHashMap<TileId, TileEntry>;
 
 /// Parse index from raw `index.bin` bytes.
 fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
@@ -100,7 +109,14 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
 
     for chunk in data.chunks_exact(TILE_INDEX_ENTRY_SIZE) {
         let e = TileIndexEntry::from_bytes(chunk.try_into().unwrap());
-        entries.insert(e.tile_id, (e.offset, e.size));
+        entries.insert(
+            e.tile_id,
+            TileEntry {
+                offset: e.offset,
+                size: e.size,
+                gz_size: AtomicU32::new(0),
+            },
+        );
     }
 
     if entries.is_empty() {
@@ -150,7 +166,14 @@ fn parse_index_from_tar_scan(data: &[u8]) -> Result<TileIndex, TarError> {
                     data_size
                 );
             } else {
-                entries.insert(tile_id, (data_offset, data_size as u32));
+                entries.insert(
+                    tile_id,
+                    TileEntry {
+                        offset: data_offset,
+                        size: data_size as u32,
+                        gz_size: AtomicU32::new(0),
+                    },
+                );
             }
         }
 
@@ -388,17 +411,38 @@ impl S3Archive {
 
     /// Fetch a tile by its ID. Returns `None` if the tile is not in the index.
     pub async fn get_tile(&self, tile_id: TileId) -> Result<Option<Bytes>, S3Error> {
-        let Some(&(offset, size)) = self.index.get(&tile_id) else {
+        let Some(entry) = self.index.get(&tile_id) else {
             return Ok(None);
         };
 
-        let data = get_range(&self.client, &self.bucket, &self.key, offset, size as u64).await?;
+        let data = get_range(
+            &self.client,
+            &self.bucket,
+            &self.key,
+            entry.offset,
+            entry.size as u64,
+        )
+        .await?;
         Ok(Some(data))
     }
 
-    /// Returns the tile size in bytes from the index, or `None` if the tile doesn't exist.
+    /// Returns the uncompressed tile size from the index, or `None` if the tile doesn't exist.
     pub fn tile_size(&self, tile_id: TileId) -> Option<u32> {
-        self.index.get(&tile_id).map(|&(_, size)| size)
+        self.index.get(&tile_id).map(|e| e.size)
+    }
+
+    /// Returns the cached gzip-compressed size, or 0 if not yet computed.
+    pub fn tile_gz_size(&self, tile_id: TileId) -> Option<u32> {
+        self.index
+            .get(&tile_id)
+            .map(|e| e.gz_size.load(Ordering::Relaxed))
+    }
+
+    /// Cache the gzip-compressed size for a tile. Benign race on concurrent writes.
+    pub fn cache_tile_gz_size(&self, tile_id: TileId, size: u32) {
+        if let Some(e) = self.index.get(&tile_id) {
+            e.gz_size.store(size, Ordering::Relaxed);
+        }
     }
 }
 
@@ -465,21 +509,21 @@ async fn detect_dataset_id(
     key: &str,
     index: &TileIndex,
 ) -> Result<u64, S3Error> {
-    let &(offset, size) = index
+    let entry = index
         .values()
         .next()
         .ok_or_else(|| S3Error::Protocol("no tiles in index to read header from".into()))?;
 
     // We need at least GRAPH_TILE_HEADER_SIZE bytes from the tile
     let read_size = GRAPH_TILE_HEADER_SIZE as u64;
-    if (size as u64) < read_size {
+    if (entry.size as u64) < read_size {
         return Err(S3Error::Protocol(format!(
             "tile is only {} bytes, too small for GraphTileHeader ({} bytes)",
-            size, GRAPH_TILE_HEADER_SIZE
+            entry.size, GRAPH_TILE_HEADER_SIZE
         )));
     }
 
-    let data = get_range(client, bucket, key, offset, read_size).await?;
+    let data = get_range(client, bucket, key, entry.offset, read_size).await?;
     let dataset_id = parse_dataset_id(&data)?;
 
     if dataset_id == 0 {
@@ -664,8 +708,10 @@ mod tests {
 
         assert_eq!(index.len(), 2);
 
-        assert_eq!(index[&TileId::new(0x1088)], (3281408, 648));
-        assert_eq!(index[&TileId::new(0x005B1B0A)], (5000000, 12345));
+        let e0 = &index[&TileId::new(0x1088)];
+        assert_eq!((e0.offset, e0.size), (3281408, 648));
+        let e1 = &index[&TileId::new(0x005B1B0A)];
+        assert_eq!((e1.offset, e1.size), (5000000, 12345));
 
         assert!(index.get(&TileId::new(0xDEAD)).is_none());
     }
@@ -703,8 +749,9 @@ mod tests {
 
         let expected_id = TileId::from_path("2/000/818/660.gph").unwrap();
         // Data starts right after the 512-byte header
+        let e = &index[&expected_id];
         assert_eq!(
-            index[&expected_id],
+            (e.offset, e.size),
             (TAR_BLOCK_SIZE as u64, tile_data.len() as u32)
         );
     }
@@ -724,15 +771,15 @@ mod tests {
         assert_eq!(index.len(), 3);
 
         assert_eq!(
-            index[&TileId::from_path("2/000/818/660.gph").unwrap()].1,
+            index[&TileId::from_path("2/000/818/660.gph").unwrap()].size,
             data1.len() as u32
         );
         assert_eq!(
-            index[&TileId::from_path("0/000/529.csv").unwrap()].1,
+            index[&TileId::from_path("0/000/529.csv").unwrap()].size,
             data2.len() as u32
         );
         assert_eq!(
-            index[&TileId::from_path("2/000/100/200.spd").unwrap()].1,
+            index[&TileId::from_path("2/000/100/200.spd").unwrap()].size,
             data3.len() as u32
         );
     }
@@ -772,15 +819,11 @@ mod tests {
         assert_eq!(index.len(), 2);
 
         // First entry: header at 0, data at 512
-        assert_eq!(
-            index[&TileId::from_path("2/000/000/001").unwrap()],
-            (512, 600)
-        );
+        let e1 = &index[&TileId::from_path("2/000/000/001").unwrap()];
+        assert_eq!((e1.offset, e1.size), (512, 600));
         // Second entry: after header(512) + 2 data blocks(1024) = 1536, then its own header(512) -> data at 2048
-        assert_eq!(
-            index[&TileId::from_path("2/000/000/002").unwrap()],
-            (512 + 1024 + 512, 100)
-        );
+        let e2 = &index[&TileId::from_path("2/000/000/002").unwrap()];
+        assert_eq!((e2.offset, e2.size), (512 + 1024 + 512, 100));
     }
 
     #[test]
