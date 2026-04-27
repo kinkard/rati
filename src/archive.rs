@@ -126,70 +126,6 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
     Ok(entries)
 }
 
-/// Build an index by sequentially scanning tar headers.
-///
-/// This is the fallback for archives that don't have `index.bin` as the first entry
-/// (e.g., speed tile archives). It iterates every tar header in the archive, parses
-/// filenames into `TileId`s, and records their (offset, size). Non-tile entries
-/// (filenames that don't parse as tile paths) are silently skipped.
-///
-/// `data` must be the entire tar archive content (or at least all headers and entry
-/// data up to the last tile).
-fn parse_index_from_tar_scan(data: &[u8]) -> Result<TileIndex, TarError> {
-    let mut entries = FxHashMap::default();
-
-    let mut pos = 0usize;
-    while pos + TAR_BLOCK_SIZE <= data.len() {
-        // Check for end-of-archive marker. POSIX requires two consecutive zero blocks,
-        // but we stop at the first one — this is safe because a valid tar entry always
-        // has a non-zero header (at minimum the checksum field), so a single zero block
-        // unambiguously signals the end of meaningful content.
-        let header_block = &data[pos..pos + TAR_BLOCK_SIZE];
-        if header_block.iter().all(|&b| b == 0) {
-            break;
-        }
-
-        let header_array: &[u8; TAR_BLOCK_SIZE] = header_block
-            .try_into()
-            .map_err(|_| TarError::InvalidHeader("header block too short".into()))?;
-        let header = TarHeader::parse(header_array)?;
-
-        let data_offset = (pos + TAR_BLOCK_SIZE) as u64;
-        let data_size = header.size;
-
-        // Try to parse filename as a tile path; skip non-tile entries (e.g., index.bin, directories)
-        if let Some(tile_id) = TileId::from_path(&header.name) {
-            if data_size > u32::MAX as u64 {
-                tracing::warn!(
-                    "Skipping tile {} ({} bytes): exceeds u32::MAX size limit",
-                    header.name,
-                    data_size
-                );
-            } else {
-                entries.insert(
-                    tile_id,
-                    TileEntry {
-                        offset: data_offset,
-                        size: data_size as u32,
-                        gz_size: AtomicU32::new(0),
-                    },
-                );
-            }
-        }
-
-        // Advance past header + data (padded to 512-byte boundary)
-        let data_blocks = (data_size as usize).div_ceil(TAR_BLOCK_SIZE);
-        pos += TAR_BLOCK_SIZE + data_blocks * TAR_BLOCK_SIZE;
-    }
-
-    if entries.is_empty() {
-        return Err(TarError::EmptyIndex);
-    }
-    entries.shrink_to_fit();
-
-    Ok(entries)
-}
-
 /// Parse the first tar header from raw bytes and extract the index.bin file content range.
 ///
 /// Returns `(data_offset, data_size)` — the byte range within the archive where `index.bin`
@@ -301,8 +237,8 @@ impl S3Archive {
     /// Uses the default AWS credential chain (SSO, IRSA, env vars, IMDS).
     ///
     /// If the first tar entry is not `index.bin` and `scan_index` is true, falls back
-    /// to scanning the entire archive's tar headers to build the index. This requires
-    /// downloading the full archive and can be slow for large files.
+    /// to scanning tar headers via range requests to build the index.
+    /// N.B.: That might be really slow for large archives as tar has no central directory.
     ///
     /// `dataset_id_override` — if provided, used as the dataset ID instead of auto-detection.
     ///
@@ -341,6 +277,11 @@ impl S3Archive {
             .ok_or_else(|| S3Error::Protocol("S3 HeadObject returned no Last-Modified".into()))?
             .into();
 
+        let archive_size = head
+            .content_length()
+            .ok_or_else(|| S3Error::Protocol("S3 HeadObject returned no Content-Length".into()))?
+            as u64;
+
         // Step 1: Read the first 512-byte tar header
         let header_bytes = get_range(&client, bucket, key, 0, 512).await?;
         let header: &[u8; 512] = header_bytes
@@ -356,11 +297,10 @@ impl S3Archive {
             }
             Err(TarError::FirstEntryNotIndex { .. }) if scan_index => {
                 tracing::warn!(
-                    "index.bin not found in archive; scanning tar headers to build index. \
-                     This requires reading the full archive and may be slow for large files."
+                    "index.bin not found in archive; scanning tar headers to build index \
+                     via range requests."
                 );
-                let all_bytes = get_all(&client, bucket, key).await?;
-                parse_index_from_tar_scan(&all_bytes).map_err(S3Error::Tar)?
+                scan_tar_headers(&client, bucket, key, archive_size).await?
             }
             Err(TarError::FirstEntryNotIndex { .. }) => {
                 return Err(S3Error::Tar(TarError::MissingIndexNoScan));
@@ -476,24 +416,120 @@ async fn get_range(
     Ok(data)
 }
 
-/// Used for the `--scan-index` fallback when we need to scan all tar headers.
-async fn get_all(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Result<Bytes, S3Error> {
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| S3Error::Request(format!("{e}")))?;
+/// Scan tar headers via S3 range requests to build the tile index.
+///
+/// Reads the archive in fixed-offset 8 MB chunks, parsing only the 512-byte tar
+/// headers and skipping over tile data. Up to `PREFETCH` chunks are in-flight
+/// concurrently (via [`futures_util::StreamExt::buffered`]), so the next chunk is
+/// typically ready by the time the scanner finishes the current one.
+async fn scan_tar_headers(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    archive_size: u64,
+) -> Result<TileIndex, S3Error> {
+    use futures_util::{StreamExt, stream};
 
-    let data = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| S3Error::Request(format!("reading response body: {e}")))?
-        .into_bytes();
+    // Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
+    // ~10k chunk requests (with prefetch) is much faster than 205k sequential header reads.
+    const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+    const PREFETCH: usize = 8;
 
-    Ok(data)
+    let num_chunks = archive_size.div_ceil(CHUNK_SIZE);
+    let mut chunks = stream::iter(0..num_chunks)
+        .map(|i| {
+            let offset = i * CHUNK_SIZE;
+            let len = CHUNK_SIZE.min(archive_size - offset);
+            get_range(client, bucket, key, offset, len)
+        })
+        .buffered(PREFETCH);
+
+    let mut entries = FxHashMap::default();
+    let mut pos: u64 = 0;
+
+    // Current chunk and its position within the archive
+    let mut chunk = Bytes::new();
+    let mut chunk_start: u64 = 0;
+    let mut next_chunk_idx: u64 = 0;
+
+    while pos + TAR_BLOCK_SIZE as u64 <= archive_size {
+        // Advance stream to the chunk containing `pos`, discarding any skipped chunks
+        let needed_chunk = pos / CHUNK_SIZE;
+        while next_chunk_idx <= needed_chunk {
+            chunk = chunks
+                .next()
+                .await
+                .ok_or_else(|| S3Error::Protocol("unexpected end of chunk stream".into()))??;
+            chunk_start = next_chunk_idx * CHUNK_SIZE;
+            next_chunk_idx += 1;
+        }
+
+        let local = (pos - chunk_start) as usize;
+        let chunk_remaining = chunk.len() - local;
+
+        // Read header, stitching across chunk boundary if necessary
+        let header_buf;
+        let header_array: &[u8; TAR_BLOCK_SIZE] = if chunk_remaining >= TAR_BLOCK_SIZE {
+            (&chunk[local..local + TAR_BLOCK_SIZE]).try_into().unwrap()
+        } else {
+            header_buf = {
+                let mut buf = [0u8; TAR_BLOCK_SIZE];
+                buf[..chunk_remaining].copy_from_slice(&chunk[local..]);
+                chunk = chunks
+                    .next()
+                    .await
+                    .ok_or_else(|| S3Error::Protocol("unexpected end of chunk stream".into()))??;
+                chunk_start = next_chunk_idx * CHUNK_SIZE;
+                next_chunk_idx += 1;
+                buf[chunk_remaining..].copy_from_slice(&chunk[..TAR_BLOCK_SIZE - chunk_remaining]);
+                buf
+            };
+            &header_buf
+        };
+
+        // End-of-archive marker (zero block)
+        if header_array.iter().all(|&b| b == 0) {
+            break;
+        }
+
+        let header = TarHeader::parse(header_array).map_err(S3Error::Tar)?;
+
+        let data_offset = pos + TAR_BLOCK_SIZE as u64;
+        let data_size = header.size;
+
+        if let Some(tile_id) = TileId::from_path(&header.name) {
+            if data_size > u32::MAX as u64 {
+                tracing::warn!(
+                    "Skipping tile {} ({data_size} bytes): exceeds u32::MAX size limit",
+                    header.name,
+                );
+            } else {
+                entries.insert(
+                    tile_id,
+                    TileEntry {
+                        offset: data_offset,
+                        size: data_size as u32,
+                        gz_size: AtomicU32::new(0),
+                    },
+                );
+                if entries.len() % 1000 == 0 {
+                    tracing::info!("Scanned {} tiles so far...", entries.len());
+                }
+            }
+        }
+
+        // Advance past header + data (padded to 512-byte boundary)
+        let data_blocks = data_size.div_ceil(TAR_BLOCK_SIZE as u64);
+        pos = data_offset + data_blocks * TAR_BLOCK_SIZE as u64;
+    }
+
+    if entries.is_empty() {
+        return Err(S3Error::Tar(TarError::EmptyIndex));
+    }
+    entries.shrink_to_fit();
+
+    tracing::info!("Built index from tar scan: {} tiles", entries.len());
+    Ok(entries)
 }
 
 /// Try to detect the dataset ID by reading the first tile's `GraphTileHeader`.
@@ -638,23 +674,6 @@ mod tests {
         data
     }
 
-    /// Build a complete tar archive in memory from a list of (filename, data) entries.
-    /// Appends a two-block end-of-archive marker.
-    fn make_tar_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut archive = Vec::new();
-        for &(name, data) in entries {
-            let header = make_tar_header(name, data.len() as u64);
-            archive.extend_from_slice(&header);
-            archive.extend_from_slice(data);
-            // Pad to 512-byte boundary
-            let padding = (TAR_BLOCK_SIZE - (data.len() % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
-            archive.extend(std::iter::repeat_n(0u8, padding));
-        }
-        // End-of-archive: two zero blocks
-        archive.extend(std::iter::repeat_n(0u8, TAR_BLOCK_SIZE * 2));
-        archive
-    }
-
     #[test]
     fn from_path_gph_test() {
         let id = TileId::from_path("2/000/818/660.gph").unwrap();
@@ -737,93 +756,6 @@ mod tests {
         assert_eq!(octal_to_u64(b"0000144 \0\0\0\0"), 100);
         // Zero
         assert_eq!(octal_to_u64(b"00000000000\0"), 0);
-    }
-
-    #[test]
-    fn scan_index_single_tile() {
-        let tile_data = b"fake tile content";
-        let archive = make_tar_archive(&[("2/000/818/660.gph", tile_data)]);
-
-        let index = parse_index_from_tar_scan(&archive).unwrap();
-        assert_eq!(index.len(), 1);
-
-        let expected_id = TileId::from_path("2/000/818/660.gph").unwrap();
-        // Data starts right after the 512-byte header
-        let e = &index[&expected_id];
-        assert_eq!(
-            (e.offset, e.size),
-            (TAR_BLOCK_SIZE as u64, tile_data.len() as u32)
-        );
-    }
-
-    #[test]
-    fn scan_index_multiple_tiles() {
-        let data1 = b"tile one";
-        let data2 = b"tile two data here";
-        let data3 = b"third";
-        let archive = make_tar_archive(&[
-            ("2/000/818/660.gph", data1),
-            ("0/000/529.csv", data2),
-            ("2/000/100/200.spd", data3),
-        ]);
-
-        let index = parse_index_from_tar_scan(&archive).unwrap();
-        assert_eq!(index.len(), 3);
-
-        assert_eq!(
-            index[&TileId::from_path("2/000/818/660.gph").unwrap()].size,
-            data1.len() as u32
-        );
-        assert_eq!(
-            index[&TileId::from_path("0/000/529.csv").unwrap()].size,
-            data2.len() as u32
-        );
-        assert_eq!(
-            index[&TileId::from_path("2/000/100/200.spd").unwrap()].size,
-            data3.len() as u32
-        );
-    }
-
-    #[test]
-    fn scan_index_skips_non_tile_entries() {
-        let tile_data = b"real tile";
-        let archive = make_tar_archive(&[
-            ("index.bin", b"not a real index but whatever" as &[u8]),
-            ("2/000/818/660.gph", tile_data),
-            ("metadata.json", b"{}"),
-        ]);
-
-        let index = parse_index_from_tar_scan(&archive).unwrap();
-        // Only the tile entry should be indexed; index.bin and metadata.json are skipped
-        assert_eq!(index.len(), 1);
-        assert!(index.contains_key(&TileId::from_path("2/000/818/660.gph").unwrap()));
-    }
-
-    #[test]
-    fn scan_index_empty_archive_fails() {
-        // Archive with only non-tile entries
-        let archive = make_tar_archive(&[("readme.txt", b"hello")]);
-        let err = parse_index_from_tar_scan(&archive).unwrap_err();
-        assert!(matches!(err, TarError::EmptyIndex));
-    }
-
-    #[test]
-    fn scan_index_verifies_data_offsets() {
-        // Two tiles: verify the second tile's offset accounts for header + data + padding of the first
-        let data1 = vec![0xAA; 600]; // 600 bytes -> 2 data blocks (1024 bytes padded)
-        let data2 = vec![0xBB; 100]; // 100 bytes -> 1 data block (512 bytes padded)
-        let archive =
-            make_tar_archive(&[("2/000/000/001.gph", &data1), ("2/000/000/002.gph", &data2)]);
-
-        let index = parse_index_from_tar_scan(&archive).unwrap();
-        assert_eq!(index.len(), 2);
-
-        // First entry: header at 0, data at 512
-        let e1 = &index[&TileId::from_path("2/000/000/001").unwrap()];
-        assert_eq!((e1.offset, e1.size), (512, 600));
-        // Second entry: after header(512) + 2 data blocks(1024) = 1536, then its own header(512) -> data at 2048
-        let e2 = &index[&TileId::from_path("2/000/000/002").unwrap()];
-        assert_eq!((e2.offset, e2.size), (512 + 1024 + 512, 100));
     }
 
     #[test]

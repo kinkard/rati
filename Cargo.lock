@@ -1543,6 +1543,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "futures-util",
  "rustc-hash",
  "serde",
  "thiserror",
