@@ -150,8 +150,8 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
     let count = data.len() / TILE_INDEX_ENTRY_SIZE;
     let mut entries: TileIndex = FxHashMap::with_capacity_and_hasher(count, Default::default());
 
-    for chunk in data.chunks_exact(TILE_INDEX_ENTRY_SIZE) {
-        let e = TileIndexEntry::from_bytes(chunk.try_into().unwrap());
+    for chunk in data.as_chunks::<TILE_INDEX_ENTRY_SIZE>().0 {
+        let e = TileIndexEntry::from_bytes(chunk);
         entries.insert(
             e.tile_id,
             TileEntry {
